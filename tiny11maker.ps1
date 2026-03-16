@@ -139,7 +139,6 @@ function Format-Duration {
 
 function Format-CommandLine {
     param (
-        [string]$FilePath,
         [string[]]$Arguments
     )
 
@@ -153,7 +152,17 @@ function Format-CommandLine {
         }
     }
 
-    return ($FilePath, ($renderedArguments -join ' ')).Where({ $_ }) -join ' '
+    return ($renderedArguments -join ' ')
+}
+
+function Format-CommandInvocation {
+    param (
+        [string]$FilePath,
+        [string[]]$Arguments
+    )
+
+    $renderedArguments = Format-CommandLine -Arguments $Arguments
+    return ($FilePath, $renderedArguments).Where({ $_ }) -join ' '
 }
 
 function Invoke-NativeCommand {
@@ -166,11 +175,35 @@ function Invoke-NativeCommand {
         [int[]]$SuccessExitCodes = @(0)
     )
 
-    $commandLine = Format-CommandLine -FilePath $FilePath -Arguments $Arguments
+    $commandLine = Format-CommandInvocation -FilePath $FilePath -Arguments $Arguments
     Write-Host "Running native command: $commandLine"
 
-    $output = & $FilePath @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
+    $stdoutPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ("tiny11_{0}.stdout.log" -f [guid]::NewGuid())
+    $stderrPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ("tiny11_{0}.stderr.log" -f [guid]::NewGuid())
+
+    try {
+        $process = Start-Process -FilePath $FilePath `
+            -ArgumentList (Format-CommandLine -Arguments $Arguments) `
+            -Wait `
+            -PassThru `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath
+
+        $exitCode = $process.ExitCode
+        $output = @()
+
+        if (Test-Path -LiteralPath $stdoutPath) {
+            $output += Get-Content -LiteralPath $stdoutPath
+        }
+
+        if (Test-Path -LiteralPath $stderrPath) {
+            $output += Get-Content -LiteralPath $stderrPath
+        }
+    } finally {
+        Remove-Item -LiteralPath $stdoutPath -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stderrPath -ErrorAction SilentlyContinue
+    }
 
     if (-not $Quiet -and $output) {
         $output | ForEach-Object { Write-Host $_ }
@@ -184,6 +217,22 @@ function Invoke-NativeCommand {
     if ($CaptureOutput) {
         return ,$output
     }
+}
+
+function Unmount-WindowsImageNative {
+    param (
+        [string]$Path,
+        [ValidateSet('Save', 'Discard')][string]$Mode = 'Save'
+    )
+
+    $arguments = @('/Unmount-Image', "/MountDir:$Path")
+    if ($Mode -eq 'Save') {
+        $arguments += '/Commit'
+    } else {
+        $arguments += '/Discard'
+    }
+
+    Invoke-NativeCommand -FilePath 'dism' -Arguments $arguments -OperationDescription "unmounting the Windows image at $Path ($Mode)"
 }
 
 function Convert-ToRegistryProviderPath {
@@ -563,7 +612,7 @@ function Get-ElevationArguments {
         $arguments += [string]$parameterValue
     }
 
-    return (Format-CommandLine -FilePath '' -Arguments $arguments)
+    return (Format-CommandLine -Arguments $arguments)
 }
 
 function New-BuildContext {
@@ -639,9 +688,9 @@ function Get-SourceDriveLetter {
 
         if ($driveLetter -match '^[c-zC-Z]$') {
             $driveLetter = $driveLetter + ":"
-            Write-Output "Drive letter set to $driveLetter"
+            Write-Host "Drive letter set to $driveLetter"
         } else {
-            Write-Output "Invalid drive letter. Please enter a letter between C and Z."
+            Write-Host "Invalid drive letter. Please enter a letter between C and Z."
         }
     } while ($driveLetter -notmatch '^[c-zC-Z]:$')
 
@@ -659,7 +708,7 @@ function Mount-SourceIsoAndGetDriveLetter {
         throw "Source ISO '$resolvedIsoPath' must have a .iso extension."
     }
 
-    Write-Output "Mounting source ISO..."
+    Write-Host "Mounting source ISO..."
     Mount-DiskImage -ImagePath $resolvedIsoPath -StorageType ISO -ErrorAction Stop | Out-Null
 
     try {
@@ -676,7 +725,7 @@ function Mount-SourceIsoAndGetDriveLetter {
 
     $Context.SourceIsoPath = $resolvedIsoPath
     $Context.AutoMountedSourceIso = $true
-    Write-Output "Source ISO mounted on drive $($volume.DriveLetter):"
+    Write-Host "Source ISO mounted on drive $($volume.DriveLetter):"
     return "$($volume.DriveLetter):"
 }
 
@@ -713,7 +762,7 @@ function Select-WindowsImageMetadata {
             throw "Image index $RequestedIndex is not available in '$ImagePath'."
         }
 
-        Write-Output "Using image index $RequestedIndex."
+        Write-Host "Using image index $RequestedIndex."
         return $selectedImage
     }
 
@@ -742,7 +791,7 @@ function Test-BuildWorkspace {
         [string]$SourceDrive
     )
 
-    $requiredCommands = 'Get-WindowsImage', 'Export-WindowsImage', 'Mount-WindowsImage', 'Dismount-WindowsImage', 'robocopy'
+    $requiredCommands = 'Get-WindowsImage', 'Export-WindowsImage', 'Mount-WindowsImage', 'robocopy'
     foreach ($requiredCommand in $requiredCommands) {
         if (-not (Get-Command -Name $requiredCommand -ErrorAction SilentlyContinue)) {
             throw "Required command '$requiredCommand' is not available. Install the DISM PowerShell tools and retry."
@@ -969,25 +1018,25 @@ function Resolve-OscdimgPath {
 
     $adkDeploymentToolsPath = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$($Context.HostArchitecture)\Oscdimg"
     if ([System.IO.Directory]::Exists($adkDeploymentToolsPath)) {
-        Write-Output "Will be using oscdimg.exe from system ADK."
+        Write-Host "Will be using oscdimg.exe from system ADK."
         return (Join-Path -Path $adkDeploymentToolsPath -ChildPath 'oscdimg.exe')
     }
 
-    Write-Output "ADK folder not found. Will be using bundled oscdimg.exe."
+    Write-Host "ADK folder not found. Will be using bundled oscdimg.exe."
     $url = "https://msdl.microsoft.com/download/symbols/oscdimg.exe/3D44737265000/oscdimg.exe"
 
     if (-not (Test-Path -Path $Context.LocalOscdimgPath)) {
-        Write-Output "Downloading oscdimg.exe..."
+        Write-Host "Downloading oscdimg.exe..."
         Invoke-WebRequest -Uri $url -OutFile $Context.LocalOscdimgPath -ErrorAction Stop
 
         if (Test-Path $Context.LocalOscdimgPath) {
-            Write-Output "oscdimg.exe downloaded successfully."
+            Write-Host "oscdimg.exe downloaded successfully."
             $Context.DownloadedOscdimg = $true
         } else {
             throw "Failed to download oscdimg.exe."
         }
     } else {
-        Write-Output "oscdimg.exe already exists locally."
+        Write-Host "oscdimg.exe already exists locally."
     }
 
     return $Context.LocalOscdimgPath
@@ -1490,7 +1539,7 @@ function Invoke-InstallImageBuild {
     Write-Output "Cleanup complete."
     Write-Output ' '
     Write-Output "Unmounting image..."
-    Dismount-WindowsImage -Path $Context.ScratchDirectoryPath -Save -ErrorAction Stop
+    Unmount-WindowsImageNative -Path $Context.ScratchDirectoryPath -Mode Save
     $Context.MountedImagePath = $null
     Write-Host "Exporting image..."
     Invoke-NativeCommand -FilePath 'dism' -Arguments @('/Export-Image', "/SourceImageFile:$($Context.InstallWimPath)", "/SourceIndex:$($Context.ImageIndex)", "/DestinationImageFile:$($Context.SourcesPath)\install2.wim", '/Compress:recovery') -OperationDescription 'exporting the optimized Windows image'
@@ -1522,7 +1571,7 @@ function Invoke-BootImageBuild {
     Write-Output "Unmounting Registry..."
     Unload-OfflineRegistryHives -Context $Context
     Write-Output "Unmounting image..."
-    Dismount-WindowsImage -Path $Context.ScratchDirectoryPath -Save -ErrorAction Stop
+    Unmount-WindowsImageNative -Path $Context.ScratchDirectoryPath -Mode Save
     $Context.MountedImagePath = $null
     Clear-Host
 }
@@ -1673,7 +1722,7 @@ try {
     if ($Context.MountedImagePath) {
         Write-Output "Attempting to dismount the mounted image..."
         try {
-            Dismount-WindowsImage -Path $Context.MountedImagePath -Discard -ErrorAction Stop
+            Unmount-WindowsImageNative -Path $Context.MountedImagePath -Mode Discard
             Write-Output "Mounted image discarded successfully."
         } catch {
             Write-Warning "Failed to dismount $($Context.MountedImagePath). You may need to discard it manually."
